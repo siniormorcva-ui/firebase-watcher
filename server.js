@@ -1,10 +1,4 @@
-// server.js
-// Realtime multi-project & multi-baseNode Firebase RTDB listener (Render Web Service)
-// - Chỉ attach data listener sau khi ENCKEY đã sẵn sàng
-// - Hỗ trợ project có 1 hoặc nhiều baseNode (baseNode | baseNodes[])
-// - Debounce khi ghi, backoff + jitter khi lỗi, log chi tiết
-// - Endpoints: /healthz, /status
-
+// server.js — multi-project & multi-baseNode (key ở cấp root, data ở dưới baseNode)
 const express = require("express");
 const admin = require("firebase-admin");
 const CryptoJS = require("crypto-js");
@@ -18,31 +12,22 @@ const START_STAGGER_MS = Number(process.env.START_STAGGER_MS || 800);
 const BATCH_WINDOW_MS  = Number(process.env.BATCH_WINDOW_MS  || 250);
 const KEY_FORMAT       = (process.env.KEY_FORMAT || "utf8").toLowerCase(); // utf8|base64|hex
 
-// ---------- Logger ----------
 function ts() { return new Date().toISOString(); }
 function j(x) { try { return JSON.stringify(x); } catch { return String(x); } }
 function log(msg, ctx = {}) { console.log(`${ts()} ${msg} ${Object.keys(ctx).length ? j(ctx) : ""}`); }
 
-// ---------- Config ----------
 function readProjects() {
   let arr = [];
   try { arr = JSON.parse(process.env.PROJECTS_JSON || "[]"); }
-  catch (e) {
-    log("❌ PROJECTS_JSON parse error", { error: e.message });
-    process.exit(1);
-  }
-  if (!Array.isArray(arr) || arr.length === 0) {
-    log("❌ PROJECTS_JSON must be a non-empty array");
-    process.exit(1);
-  }
+  catch (e) { log("❌ PROJECTS_JSON parse error", { error: e.message }); process.exit(1); }
+  if (!Array.isArray(arr) || arr.length === 0) { log("❌ PROJECTS_JSON must be a non-empty array"); process.exit(1); }
   for (const p of arr) {
-    if (!p.name)               { log("❌ PROJECTS_JSON missing field", { field: "name" });               process.exit(1); }
+    if (!p.name)               { log("❌ PROJECTS_JSON missing field", { field: "name" }); process.exit(1); }
     if (!p.serviceAccountPath) { log("❌ PROJECTS_JSON missing field", { project: p.name, field: "serviceAccountPath" }); process.exit(1); }
     if (!p.databaseURL)        { log("❌ PROJECTS_JSON missing field", { project: p.name, field: "databaseURL" });        process.exit(1); }
-    if (!p.baseNode && !p.baseNodes) {
-      log("❌ PROJECTS_JSON must have baseNode or baseNodes", { project: p.name });
-      process.exit(1);
-    }
+    if (!p.baseNode && !p.baseNodes) { log("❌ PROJECTS_JSON must have baseNode or baseNodes", { project: p.name }); process.exit(1); }
+    if (!p.keyNode)            { log("❌ PROJECTS_JSON missing field", { project: p.name, field: "keyNode" }); process.exit(1); }
+    if (!p.dataNode)           { log("❌ PROJECTS_JSON missing field", { project: p.name, field: "dataNode" }); process.exit(1); }
   }
   return arr;
 }
@@ -59,107 +44,71 @@ function parseKey(str) {
   if (KEY_FORMAT === "hex")    return CryptoJS.enc.Hex.parse(str);
   return CryptoJS.enc.Utf8.parse(str);
 }
-
 function decryptAES(ciphertext, keyStr, ivStr) {
   const KEY = parseKey(keyStr);
   const IV  = parseKey(ivStr);
-  const bytes = CryptoJS.AES.decrypt(ciphertext, KEY, {
-    iv: IV, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7
-  });
+  const bytes = CryptoJS.AES.decrypt(ciphertext, KEY, { iv: IV, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 });
   return bytes.toString(CryptoJS.enc.Utf8);
 }
 
 function splitCsv(s) { return (s || "").split(",").map(x=>x.trim()).filter(Boolean); }
-function diffNewIDs(currCsv, prevCsv) {
-  const curr = splitCsv(currCsv);
-  const prev = new Set(splitCsv(prevCsv));
-  return curr.filter(id => !prev.has(id));
-}
+function diffNewIDs(currCsv, prevCsv) { const curr = splitCsv(currCsv); const prev = new Set(splitCsv(prevCsv)); return curr.filter(id => !prev.has(id)); }
 
 const PROJECTS = readProjects();
 
-// ---------- Global State ----------
-// appState[projectName] = { app, db }
+// appState[project] = { app, db }
 const appState  = Object.create(null);
-
-// nodeState[nodeKey] = {
-//   projectName, baseNode, databaseURL, keyNode, dataNode,
-//   aesKey, aesIv, prevON, prevONC,
-//   lastEventAt, updatesQueue, debounceTimer,
-//   listenersAttached, failures, backoffMs,
-//   keyRef, dataRef, dataListenerAttached, _handleDataValue
-// }
+// nodeState[project/baseNode] = {...}
 const nodeState = Object.create(null);
-
 function nodeKeyOf(projectName, baseNode) { return `${projectName}/${baseNode}`; }
 
-// ---------- Ensure project app ----------
 function ensureProjectApp(project) {
   if (appState[project.name]) return appState[project.name];
   const svc = loadServiceAccount(project.serviceAccountPath);
-  const appInst = admin.initializeApp({
-    credential: admin.credential.cert(svc),
-    databaseURL: project.databaseURL
-  }, project.name);
+  const appInst = admin.initializeApp({ credential: admin.credential.cert(svc), databaseURL: project.databaseURL }, project.name);
   const db = appInst.database();
   appState[project.name] = { app: appInst, db };
   log(`[${project.name}] 🧩 app initialized`, { databaseURL: project.databaseURL });
   return appState[project.name];
 }
 
-// ---------- Debounce flush per node ----------
+// debounce flush per node
 function scheduleFlushNode(projectName, baseNode) {
   const nk = nodeKeyOf(projectName, baseNode);
   const st = nodeState[nk];
   if (st.debounceTimer) return;
-
   const { db } = appState[projectName];
 
   st.debounceTimer = setTimeout(async () => {
     const started = Date.now();
-    const payload = st.updatesQueue;
-    st.updatesQueue = {};
-    st.debounceTimer = null;
-
+    const payload = st.updatesQueue; st.updatesQueue = {}; st.debounceTimer = null;
     const paths = Object.keys(payload);
-    if (paths.length === 0) {
-      log(`[${nk}] ⏭️ flush skipped (empty queue)`);
-      return;
-    }
-
+    if (!paths.length) { log(`[${nk}] ⏭️ flush skipped (empty queue)`); return; }
     try {
       log(`[${nk}] ⬆️ flushing`, { paths: paths.length });
       await db.ref().update(payload);
-
       const took = Date.now() - started;
       const onCount  = paths.filter(p => p.includes("/listIDON/")).length;
       const oncCount = paths.filter(p => p.includes("/listIDONC/")).length;
-
       log(`[${nk}] ✅ flushed`, { paths: paths.length, onCount, oncCount, tookMs: took });
     } catch (e) {
       log(`[${nk}] ❌ flush error`, { error: e.message, retryQueued: paths.length });
-      // trả lại queue để thử lại lần sau
       st.updatesQueue = { ...payload, ...st.updatesQueue };
       scheduleNodeReconnect({ name: projectName }, baseNode, true);
     }
   }, BATCH_WINDOW_MS);
 }
 
-// ---------- Reconnect per node ----------
-function scheduleNodeReconnect(project, baseNode, onlyReattach = false) {
+function scheduleNodeReconnect(project, baseNode) {
   const nk = nodeKeyOf(project.name, baseNode);
   const st = nodeState[nk] || (nodeState[nk] = { failures: 0, backoffMs: 1000 });
   st.failures = (st.failures || 0) + 1;
   st.listenersAttached = false;
-
   const next = Math.min((st.backoffMs || 1000) * 2, 30000) + Math.floor(Math.random() * 500);
   st.backoffMs = next;
-
   log(`[${nk}] 🔁 scheduling reconnect`, { failures: st.failures, backoffMs: next });
-
   setTimeout(() => {
     try {
-      // tắt listener cũ nếu còn
       if (st.keyRef)  { try { st.keyRef.off(); }  catch {} }
       if (st.dataRef && st._handleDataValue) { try { st.dataRef.off("value", st._handleDataValue); } catch {} }
     } catch {}
@@ -167,61 +116,48 @@ function scheduleNodeReconnect(project, baseNode, onlyReattach = false) {
   }, next);
 }
 
-// ---------- Attach a single baseNode listeners ----------
-// Chỉ attach data listener sau khi key/iv đã sẵn sàng
+// === CHỖ SỬA CHÍNH: key ở root, data ở dưới baseNode ===
 function attachBaseNodeListener(project, baseNode) {
   const { name: projectName, databaseURL, keyNode = "ENCKEY", dataNode = "SetRuContent" } = project;
   const { db } = ensureProjectApp(project);
-
   const nk = nodeKeyOf(projectName, baseNode);
+
   if (!nodeState[nk]) {
     nodeState[nk] = {
       projectName, baseNode, databaseURL, keyNode, dataNode,
-      aesKey: null, aesIv: null,
-      prevON: "", prevONC: "",
-      lastEventAt: 0,
-      updatesQueue: {},
-      debounceTimer: null,
-      listenersAttached: false,
-      failures: 0,
-      backoffMs: 1000,
-      keyRef: null, dataRef: null,
-      dataListenerAttached: false,
-      _handleDataValue: null
+      aesKey: null, aesIv: null, prevON: "", prevONC: "",
+      lastEventAt: 0, updatesQueue: {}, debounceTimer: null,
+      listenersAttached: false, failures: 0, backoffMs: 1000,
+      keyRef: null, dataRef: null, dataListenerAttached: false, _handleDataValue: null
     };
   }
   const st = nodeState[nk];
   if (st.listenersAttached) return;
 
-  st.keyRef  = db.ref(`${baseNode}/${keyNode}`);
-  st.dataRef = db.ref(`${baseNode}/${dataNode}`);
+  // key ở root (đường dẫn tuyệt đối do bạn chỉ định bằng keyNode)
+  const keyPathAbs = keyNode.startsWith("/") ? keyNode.slice(1) : keyNode;
+  st.keyRef  = db.ref(keyPathAbs);
 
-  // --- ENCKEY listener: khi có key/iv mới attach data listener ---
-  st.keyRef.on(
-    "value",
+  // data nằm dưới baseNode
+  const dataPath = `${baseNode}/${dataNode}`;
+  st.dataRef = db.ref(dataPath);
+
+  // ENCKEY listener: khi có key/iv mới attach data listener
+  st.keyRef.on("value",
     (snap) => {
       const v = snap.val();
       if (v?.key && v?.iv) {
-        st.aesKey = v.key;
-        st.aesIv  = v.iv;
-        log(`[${nk}] 🔐 AES key/iv loaded`, { node: `${baseNode}/${keyNode}`, keyFormat: KEY_FORMAT });
+        st.aesKey = v.key; st.aesIv = v.iv;
+        log(`[${nk}] 🔐 AES key/iv loaded`, { keyPath: keyPathAbs, keyFormat: KEY_FORMAT });
 
         if (!st.dataListenerAttached) {
           st._handleDataValue = async (snap) => {
             st.lastEventAt = Date.now();
             const encrypted = snap.val();
             const len = String(encrypted || "").length;
-            log(`[${nk}] ⬇️ payload`, { node: `${baseNode}/${dataNode}`, length: len });
-
-            if (!encrypted) {
-              log(`[${nk}] ℹ️ empty encrypted payload`);
-              return;
-            }
-            if (!st.aesKey || !st.aesIv) {
-              // key/iv có thể vừa bị xoá/rotate
-              log(`[${nk}] ℹ️ AES key/iv not ready (post-attach)`);
-              return;
-            }
+            log(`[${nk}] ⬇️ payload`, { dataPath, length: len });
+            if (!encrypted) { log(`[${nk}] ℹ️ empty encrypted payload`); return; }
+            if (!st.aesKey || !st.aesIv) { log(`[${nk}] ℹ️ AES key/iv not ready (post-attach)`); return; }
 
             try {
               const t0 = Date.now();
@@ -231,26 +167,16 @@ function attachBaseNodeListener(project, baseNode) {
 
               const currON  = json.listIDON  || "";
               const currONC = json.listIDONC || "";
-
               const newON   = diffNewIDs(currON,  st.prevON);
               const newONC  = diffNewIDs(currONC, st.prevONC);
 
-              log(`[${nk}] 🔎 diff`, {
-                decryptMs,
-                currON_len: splitCsv(currON).length,
-                currONC_len: splitCsv(currONC).length,
-                newON: newON.length, newONC: newONC.length
-              });
+              log(`[${nk}] 🔎 diff`, { decryptMs, currON_len: splitCsv(currON).length, currONC_len: splitCsv(currONC).length, newON: newON.length, newONC: newONC.length });
 
               if (newON.length || newONC.length) {
                 const nowSec = Math.floor(Date.now() / 1000);
                 for (const id of newON)  st.updatesQueue[`${baseNode}/ActivatedTime/listIDON/${id}`]  = nowSec;
                 for (const id of newONC) st.updatesQueue[`${baseNode}/ActivatedTime/listIDONC/${id}`] = nowSec;
-
-                log(`[${nk}] ➕ queue updates`, {
-                  addON: newON, addONC: newONC,
-                  queueSize: Object.keys(st.updatesQueue).length
-                });
+                log(`[${nk}] ➕ queue updates`, { addON: newON, addONC: newONC, queueSize: Object.keys(st.updatesQueue).length });
                 scheduleFlushNode(projectName, baseNode);
               } else {
                 log(`[${nk}] 🟰 no new IDs`);
@@ -264,43 +190,35 @@ function attachBaseNodeListener(project, baseNode) {
           };
 
           st.dataRef.on("value", st._handleDataValue, (err) => {
-            log(`[${nk}] Data listener error`, { error: err?.message || String(err), node: `${baseNode}/${dataNode}` });
+            log(`[${nk}] Data listener error`, { error: err?.message || String(err), dataPath });
             scheduleNodeReconnect(project, baseNode);
           });
           st.dataListenerAttached = true;
-          log(`[${nk}] 📌 Data listener attached AFTER key ready`, { node: `${baseNode}/${dataNode}` });
+          log(`[${nk}] 📌 Data listener attached AFTER key ready`, { dataPath });
         }
       } else {
-        log(`[${nk}] ⚠️ ENCKEY invalid`, { node: `${baseNode}/${keyNode}`, type: typeof v });
-        // (tuỳ chọn) nếu muốn khi mất key thì detach data listener:
-        // if (st.dataListenerAttached && st.dataRef && st._handleDataValue) {
-        //   try { st.dataRef.off("value", st._handleDataValue); } catch {}
-        //   st.dataListenerAttached = false;
-        //   log(`[${nk}] ⏹️ Data listener detached because key missing`);
-        // }
+        log(`[${nk}] ⚠️ ENCKEY invalid`, { keyPath: keyPathAbs, type: typeof v });
       }
     },
     (err) => {
-      log(`[${nk}] ENCKEY listener error`, { error: err?.message || String(err) });
+      log(`[${nk}] ENCKEY listener error`, { error: err?.message || String(err), keyPath: keyPathAbs });
       scheduleNodeReconnect(project, baseNode);
     }
   );
 
   st.listenersAttached = true;
-  st.failures = 0;
-  st.backoffMs = 1000;
-
-  log(`[${nk}] ✅ key-listener attached`, { databaseURL, baseNode, keyNode, dataNode });
+  st.failures = 0; st.backoffMs = 1000;
+  log(`[${nk}] ✅ key-listener attached`, { databaseURL, baseNode, keyPath: keyPathAbs, dataPath });
 }
 
-// ---------- Public endpoints ----------
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-
 app.get("/status", (_req, res) => {
   const projects = PROJECTS.map(p => ({
     name: p.name,
     databaseURL: p.databaseURL,
-    baseNodes: Array.isArray(p.baseNodes) ? p.baseNodes : [p.baseNode || null].filter(Boolean)
+    baseNodes: Array.isArray(p.baseNodes) ? p.baseNodes : [p.baseNode || null].filter(Boolean),
+    keyNode: p.keyNode,
+    dataNode: p.dataNode
   }));
   const nodes = {};
   for (const [nk, st] of Object.entries(nodeState)) {
@@ -315,19 +233,11 @@ app.get("/status", (_req, res) => {
       backoffMs: st.backoffMs || 0
     };
   }
-  res.json({
-    keyFormat: KEY_FORMAT,
-    startStaggerMs: START_STAGGER_MS,
-    batchWindowMs: BATCH_WINDOW_MS,
-    projects, nodes
-  });
+  res.json({ keyFormat: KEY_FORMAT, startStaggerMs: START_STAGGER_MS, batchWindowMs: BATCH_WINDOW_MS, projects, nodes });
 });
 
-// ---------- Start ----------
 app.listen(PORT, () => {
   log(`HTTP listening`, { port: PORT });
-
-  // Khởi tạo app & attach listener cho từng baseNode (so le)
   PROJECTS.forEach((p, pi) => {
     ensureProjectApp(p);
     const baseNodes = Array.isArray(p.baseNodes) ? p.baseNodes : [p.baseNode];
@@ -337,18 +247,13 @@ app.listen(PORT, () => {
   });
 });
 
-// ---------- Graceful shutdown ----------
 process.on("SIGTERM", async () => {
   log("SIGTERM received - shutting down...");
   try {
-    // tắt listener
     for (const st of Object.values(nodeState)) {
       try { st.keyRef?.off(); }  catch {}
       try { if (st.dataRef && st._handleDataValue) st.dataRef.off("value", st._handleDataValue); } catch {}
     }
-    // xoá app
     await Promise.all(Object.values(appState).map(s => s.app?.delete().catch(()=>{})));
-  } finally {
-    process.exit(0);
-  }
+  } finally { process.exit(0); }
 });
