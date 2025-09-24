@@ -1,7 +1,7 @@
 // server.js
-// Realtime multi-project & multi-baseNode Firebase RTDB listener for Render Web Service
-// - Hỗ trợ: một project có 1 hoặc nhiều baseNode (baseNode | baseNodes[])
-// - Mỗi baseNode có 2 listener (ENCKEY, SetRuContent), state riêng (prevON/prevONC, AES key/iv, queue)
+// Realtime multi-project & multi-baseNode Firebase RTDB listener (Render Web Service)
+// - Chỉ attach data listener sau khi ENCKEY đã sẵn sàng
+// - Hỗ trợ project có 1 hoặc nhiều baseNode (baseNode | baseNodes[])
 // - Debounce khi ghi, backoff + jitter khi lỗi, log chi tiết
 // - Endpoints: /healthz, /status
 
@@ -80,19 +80,20 @@ const PROJECTS = readProjects();
 
 // ---------- Global State ----------
 // appState[projectName] = { app, db }
+const appState  = Object.create(null);
+
 // nodeState[nodeKey] = {
 //   projectName, baseNode, databaseURL, keyNode, dataNode,
 //   aesKey, aesIv, prevON, prevONC,
 //   lastEventAt, updatesQueue, debounceTimer,
 //   listenersAttached, failures, backoffMs,
-//   keyRef, dataRef
+//   keyRef, dataRef, dataListenerAttached, _handleDataValue
 // }
-const appState  = Object.create(null);
 const nodeState = Object.create(null);
 
 function nodeKeyOf(projectName, baseNode) { return `${projectName}/${baseNode}`; }
 
-// ---------- Attach project (single admin app per project) ----------
+// ---------- Ensure project app ----------
 function ensureProjectApp(project) {
   if (appState[project.name]) return appState[project.name];
   const svc = loadServiceAccount(project.serviceAccountPath);
@@ -104,119 +105,6 @@ function ensureProjectApp(project) {
   appState[project.name] = { app: appInst, db };
   log(`[${project.name}] 🧩 app initialized`, { databaseURL: project.databaseURL });
   return appState[project.name];
-}
-
-// ---------- Attach a single baseNode listeners ----------
-function attachBaseNodeListener(project, baseNode) {
-  const { name: projectName, databaseURL, keyNode = "ENCKEY", dataNode = "SetRuContent" } = project;
-  const { db } = ensureProjectApp(project);
-
-  const nk = nodeKeyOf(projectName, baseNode);
-  if (!nodeState[nk]) {
-    nodeState[nk] = {
-      projectName, baseNode, databaseURL, keyNode, dataNode,
-      aesKey: null, aesIv: null,
-      prevON: "", prevONC: "",
-      lastEventAt: 0,
-      updatesQueue: {},
-      debounceTimer: null,
-      listenersAttached: false,
-      failures: 0,
-      backoffMs: 1000,
-      keyRef: null, dataRef: null
-    };
-  }
-  const st = nodeState[nk];
-  if (st.listenersAttached) return;
-
-  const keyRef  = db.ref(`${baseNode}/${keyNode}`);
-  const dataRef = db.ref(`${baseNode}/${dataNode}`);
-  st.keyRef = keyRef;
-  st.dataRef = dataRef;
-
-  keyRef.on("value",
-    (snap) => {
-      const v = snap.val();
-      if (v?.key && v?.iv) {
-        st.aesKey = v.key;
-        st.aesIv  = v.iv;
-        log(`[${nk}] 🔐 AES key/iv loaded`, { node: `${baseNode}/${keyNode}`, keyFormat: KEY_FORMAT });
-      } else {
-        log(`[${nk}] ⚠️ ENCKEY invalid`, { node: `${baseNode}/${keyNode}`, type: typeof v });
-      }
-    },
-    (err) => {
-      log(`[${nk}] ENCKEY listener error`, { error: err?.message || String(err) });
-      scheduleNodeReconnect(project, baseNode);
-    }
-  );
-
-  dataRef.on("value",
-    async (snap) => {
-      st.lastEventAt = Date.now();
-      const encrypted = snap.val();
-      const len = String(encrypted || "").length;
-      log(`[${nk}] ⬇️ payload`, { node: `${baseNode}/${dataNode}`, length: len });
-
-      if (!encrypted) {
-        log(`[${nk}] ℹ️ empty encrypted payload`);
-        return;
-      }
-      if (!st.aesKey || !st.aesIv) {
-        log(`[${nk}] ℹ️ AES key/iv not ready yet`);
-        return;
-      }
-
-      try {
-        const t0 = Date.now();
-        const decrypted = decryptAES(encrypted, st.aesKey, st.aesIv);
-        const json = JSON.parse(decrypted);
-        const decryptMs = Date.now() - t0;
-
-        const currON  = json.listIDON  || "";
-        const currONC = json.listIDONC || "";
-
-        const newON   = diffNewIDs(currON,  st.prevON);
-        const newONC  = diffNewIDs(currONC, st.prevONC);
-
-        log(`[${nk}] 🔎 diff`, {
-          decryptMs,
-          currON_len: splitCsv(currON).length,
-          currONC_len: splitCsv(currONC).length,
-          newON: newON.length, newONC: newONC.length
-        });
-
-        if (newON.length || newONC.length) {
-          const nowSec = Math.floor(Date.now() / 1000);
-          for (const id of newON)  st.updatesQueue[`${baseNode}/ActivatedTime/listIDON/${id}`]  = nowSec;
-          for (const id of newONC) st.updatesQueue[`${baseNode}/ActivatedTime/listIDONC/${id}`] = nowSec;
-
-          log(`[${nk}] ➕ queue updates`, {
-            addON: newON, addONC: newONC,
-            queueSize: Object.keys(st.updatesQueue).length
-          });
-          scheduleFlushNode(projectName, baseNode);
-        } else {
-          log(`[${nk}] 🟰 no new IDs`);
-        }
-
-        st.prevON  = currON;
-        st.prevONC = currONC;
-      } catch (e) {
-        log(`[${nk}] ❌ decrypt/json error`, { error: e.message });
-      }
-    },
-    (err) => {
-      log(`[${nk}] Data listener error`, { error: err?.message || String(err), node: `${baseNode}/${dataNode}` });
-      scheduleNodeReconnect(project, baseNode);
-    }
-  );
-
-  st.listenersAttached = true;
-  st.failures = 0;
-  st.backoffMs = 1000;
-
-  log(`[${nk}] ✅ listeners attached`, { databaseURL, baseNode, keyNode, dataNode });
 }
 
 // ---------- Debounce flush per node ----------
@@ -257,7 +145,7 @@ function scheduleFlushNode(projectName, baseNode) {
   }, BATCH_WINDOW_MS);
 }
 
-// ---------- Reconnect per node (không xoá app) ----------
+// ---------- Reconnect per node ----------
 function scheduleNodeReconnect(project, baseNode, onlyReattach = false) {
   const nk = nodeKeyOf(project.name, baseNode);
   const st = nodeState[nk] || (nodeState[nk] = { failures: 0, backoffMs: 1000 });
@@ -273,10 +161,136 @@ function scheduleNodeReconnect(project, baseNode, onlyReattach = false) {
     try {
       // tắt listener cũ nếu còn
       if (st.keyRef)  { try { st.keyRef.off(); }  catch {} }
-      if (st.dataRef) { try { st.dataRef.off(); } catch {} }
+      if (st.dataRef && st._handleDataValue) { try { st.dataRef.off("value", st._handleDataValue); } catch {} }
     } catch {}
     attachBaseNodeListener(project, baseNode);
   }, next);
+}
+
+// ---------- Attach a single baseNode listeners ----------
+// Chỉ attach data listener sau khi key/iv đã sẵn sàng
+function attachBaseNodeListener(project, baseNode) {
+  const { name: projectName, databaseURL, keyNode = "ENCKEY", dataNode = "SetRuContent" } = project;
+  const { db } = ensureProjectApp(project);
+
+  const nk = nodeKeyOf(projectName, baseNode);
+  if (!nodeState[nk]) {
+    nodeState[nk] = {
+      projectName, baseNode, databaseURL, keyNode, dataNode,
+      aesKey: null, aesIv: null,
+      prevON: "", prevONC: "",
+      lastEventAt: 0,
+      updatesQueue: {},
+      debounceTimer: null,
+      listenersAttached: false,
+      failures: 0,
+      backoffMs: 1000,
+      keyRef: null, dataRef: null,
+      dataListenerAttached: false,
+      _handleDataValue: null
+    };
+  }
+  const st = nodeState[nk];
+  if (st.listenersAttached) return;
+
+  st.keyRef  = db.ref(`${baseNode}/${keyNode}`);
+  st.dataRef = db.ref(`${baseNode}/${dataNode}`);
+
+  // --- ENCKEY listener: khi có key/iv mới attach data listener ---
+  st.keyRef.on(
+    "value",
+    (snap) => {
+      const v = snap.val();
+      if (v?.key && v?.iv) {
+        st.aesKey = v.key;
+        st.aesIv  = v.iv;
+        log(`[${nk}] 🔐 AES key/iv loaded`, { node: `${baseNode}/${keyNode}`, keyFormat: KEY_FORMAT });
+
+        if (!st.dataListenerAttached) {
+          st._handleDataValue = async (snap) => {
+            st.lastEventAt = Date.now();
+            const encrypted = snap.val();
+            const len = String(encrypted || "").length;
+            log(`[${nk}] ⬇️ payload`, { node: `${baseNode}/${dataNode}`, length: len });
+
+            if (!encrypted) {
+              log(`[${nk}] ℹ️ empty encrypted payload`);
+              return;
+            }
+            if (!st.aesKey || !st.aesIv) {
+              // key/iv có thể vừa bị xoá/rotate
+              log(`[${nk}] ℹ️ AES key/iv not ready (post-attach)`);
+              return;
+            }
+
+            try {
+              const t0 = Date.now();
+              const decrypted = decryptAES(encrypted, st.aesKey, st.aesIv);
+              const json = JSON.parse(decrypted);
+              const decryptMs = Date.now() - t0;
+
+              const currON  = json.listIDON  || "";
+              const currONC = json.listIDONC || "";
+
+              const newON   = diffNewIDs(currON,  st.prevON);
+              const newONC  = diffNewIDs(currONC, st.prevONC);
+
+              log(`[${nk}] 🔎 diff`, {
+                decryptMs,
+                currON_len: splitCsv(currON).length,
+                currONC_len: splitCsv(currONC).length,
+                newON: newON.length, newONC: newONC.length
+              });
+
+              if (newON.length || newONC.length) {
+                const nowSec = Math.floor(Date.now() / 1000);
+                for (const id of newON)  st.updatesQueue[`${baseNode}/ActivatedTime/listIDON/${id}`]  = nowSec;
+                for (const id of newONC) st.updatesQueue[`${baseNode}/ActivatedTime/listIDONC/${id}`] = nowSec;
+
+                log(`[${nk}] ➕ queue updates`, {
+                  addON: newON, addONC: newONC,
+                  queueSize: Object.keys(st.updatesQueue).length
+                });
+                scheduleFlushNode(projectName, baseNode);
+              } else {
+                log(`[${nk}] 🟰 no new IDs`);
+              }
+
+              st.prevON  = currON;
+              st.prevONC = currONC;
+            } catch (e) {
+              log(`[${nk}] ❌ decrypt/json error`, { error: e.message });
+            }
+          };
+
+          st.dataRef.on("value", st._handleDataValue, (err) => {
+            log(`[${nk}] Data listener error`, { error: err?.message || String(err), node: `${baseNode}/${dataNode}` });
+            scheduleNodeReconnect(project, baseNode);
+          });
+          st.dataListenerAttached = true;
+          log(`[${nk}] 📌 Data listener attached AFTER key ready`, { node: `${baseNode}/${dataNode}` });
+        }
+      } else {
+        log(`[${nk}] ⚠️ ENCKEY invalid`, { node: `${baseNode}/${keyNode}`, type: typeof v });
+        // (tuỳ chọn) nếu muốn khi mất key thì detach data listener:
+        // if (st.dataListenerAttached && st.dataRef && st._handleDataValue) {
+        //   try { st.dataRef.off("value", st._handleDataValue); } catch {}
+        //   st.dataListenerAttached = false;
+        //   log(`[${nk}] ⏹️ Data listener detached because key missing`);
+        // }
+      }
+    },
+    (err) => {
+      log(`[${nk}] ENCKEY listener error`, { error: err?.message || String(err) });
+      scheduleNodeReconnect(project, baseNode);
+    }
+  );
+
+  st.listenersAttached = true;
+  st.failures = 0;
+  st.backoffMs = 1000;
+
+  log(`[${nk}] ✅ key-listener attached`, { databaseURL, baseNode, keyNode, dataNode });
 }
 
 // ---------- Public endpoints ----------
@@ -294,6 +308,7 @@ app.get("/status", (_req, res) => {
       projectName: st.projectName,
       baseNode: st.baseNode,
       listenersAttached: !!st.listenersAttached,
+      dataListenerAttached: !!st.dataListenerAttached,
       lastEventAt: st.lastEventAt || 0,
       queueSize: st.updatesQueue ? Object.keys(st.updatesQueue).length : 0,
       failures: st.failures || 0,
@@ -312,7 +327,7 @@ app.get("/status", (_req, res) => {
 app.listen(PORT, () => {
   log(`HTTP listening`, { port: PORT });
 
-  // Khởi tạo app & attach listener cho từng baseNode (so le giữa các project, và giữa các node)
+  // Khởi tạo app & attach listener cho từng baseNode (so le)
   PROJECTS.forEach((p, pi) => {
     ensureProjectApp(p);
     const baseNodes = Array.isArray(p.baseNodes) ? p.baseNodes : [p.baseNode];
@@ -329,7 +344,7 @@ process.on("SIGTERM", async () => {
     // tắt listener
     for (const st of Object.values(nodeState)) {
       try { st.keyRef?.off(); }  catch {}
-      try { st.dataRef?.off(); } catch {}
+      try { if (st.dataRef && st._handleDataValue) st.dataRef.off("value", st._handleDataValue); } catch {}
     }
     // xoá app
     await Promise.all(Object.values(appState).map(s => s.app?.delete().catch(()=>{})));
