@@ -1,0 +1,14 @@
+{
+  "name": "multi-firebase-listener",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.5.0"
+  }
+}
